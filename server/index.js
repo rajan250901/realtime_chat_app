@@ -9,8 +9,10 @@ const authRoutes = require("./src/routes/authRoutes");
 const userRoutes = require("./src/routes/userRoutes");
 const conversationRoutes = require("./src/routes/conversationRoutes");
 const messageRoutes = require("./src/routes/messageRoutes");
+const groupRoutes = require("./src/routes/groupRoutes");
 
 const { connectDB } = require("./src/config/db");
+const { ensureChatSchema } = require("./src/config/chatSchema");
 
 const socketAuth = require("./src/sockets/socketAuth");
 const socketHandler = require("./src/sockets/socketHandler");
@@ -42,11 +44,13 @@ app.use(
 
 app.use(express.json());
 connectDB();
+ensureChatSchema().catch((error) => console.error("Chat schema setup failed:", error));
 
 app.use("/api/auth", authRoutes);
 app.use("/api/users", userRoutes);
 app.use("/api/conversations", conversationRoutes);
 app.use("/api/messages", messageRoutes);
+app.use("/api/groups", groupRoutes);
 
 app.get("/", (req, res) => {
     res.status(200).send("Real-Time Chat API is running");
