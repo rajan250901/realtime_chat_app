@@ -1,115 +1,380 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Login from "./components/Login";
 import Register from "./components/Register";
 import Sidebar from "./components/Sidebar";
 import ChatWindow from "./components/ChatWindow";
+
 import { getCurrentUser } from "./services/userService";
 import { getUserConversations } from "./services/conversationService";
-import { connectSocket, disconnectSocket } from "./services/socket";
+import { connectSocket, disconnectSocket, getSocket } from "./services/socket";
 
 function App() {
-  const [isAuthenticated, setIsAuthenticated] = useState(() => Boolean(localStorage.getItem("token")));
+  const [isAuthenticated, setIsAuthenticated] = useState(() =>
+    Boolean(localStorage.getItem("token")),
+  );
   const [showRegister, setShowRegister] = useState(false);
   const [currentUser, setCurrentUser] = useState(null);
   const [conversations, setConversations] = useState([]);
   const [selectedConversation, setSelectedConversation] = useState(null);
   const [showMobileChat, setShowMobileChat] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [onlineUsers, setOnlineUsers] = useState(new Set());
-  const [lastSeenByUser, setLastSeenByUser] = useState({});
   const [socketConnected, setSocketConnected] = useState(false);
+  const [onlineUserIds, setOnlineUserIds] = useState([]);
+
+  const selectedConversationRef = useRef(null);
+
+  useEffect(() => {
+    selectedConversationRef.current = selectedConversation;
+  }, [selectedConversation]);
+
+  const loadConversations = async () => {
+    const data = await getUserConversations();
+
+    const items = (data.conversations || []).map((c) => ({
+      ...c,
+      user:
+        c.type === "direct"
+          ? {
+              id: c.other_user_id,
+              name: c.other_user_name,
+              email: c.other_user_email,
+              avatar_url: c.other_user_avatar,
+              last_seen: c.other_user_last_seen,
+            }
+          : {
+              id: c.id,
+              name: c.name || "Group chat",
+              avatar_url: c.avatar_url,
+            },
+    }));
+
+    setConversations(items);
+
+    setSelectedConversation((current) => {
+      if (!current) return current;
+
+      const updated = items.find(
+        (item) => Number(item.id) === Number(current.id),
+      );
+
+      return updated || current;
+    });
+
+    return items;
+  };
 
   useEffect(() => {
     let cancelled = false;
+
     async function initializeApp() {
-      if (!isAuthenticated) { setCurrentUser(null); setConversations([]); setSelectedConversation(null); setLoading(false); return; }
+      if (!isAuthenticated) {
+        setCurrentUser(null);
+        setConversations([]);
+        setSelectedConversation(null);
+        setLoading(false);
+        return;
+      }
+
       setLoading(true);
+
       try {
         const userData = await getCurrentUser();
+
         if (cancelled) return;
+
         setCurrentUser(userData.user);
+
+        await loadConversations();
+
+        if (cancelled) return;
+
         const socket = connectSocket();
-        if (socket) {
-          const onSnapshot = ({ onlineUsers: ids = [] }) => setOnlineUsers(new Set(ids.map(Number)));
-          const onPresence = ({ userId, status, lastSeen }) => {
-            const id = Number(userId);
-            setOnlineUsers((prev) => { const next = new Set(prev); if (status === "online") next.add(id); else next.delete(id); return next; });
-            if (status === "offline" && lastSeen) setLastSeenByUser((prev) => ({ ...prev, [id]: lastSeen }));
-          };
-          const onConnect = () => setSocketConnected(true);
-          const onDisconnect = () => setSocketConnected(false);
-          socket.on("presence_snapshot", onSnapshot);
-          socket.on("presence_update", onPresence);
-          socket.on("connect", onConnect);
-          socket.on("disconnect", onDisconnect);
-          setSocketConnected(socket.connected);
-          const cleanupSocket = () => { socket.off("presence_snapshot", onSnapshot); socket.off("presence_update", onPresence); socket.off("connect", onConnect); socket.off("disconnect", onDisconnect); };
-          const conversationData = await getUserConversations();
-          if (cancelled) { cleanupSocket(); return; }
-          const items = (conversationData.conversations || []).map((c) => ({
-            ...c,
-            user: c.type === "direct" ? { id: c.other_user_id, name: c.other_user_name, email: c.other_user_email, avatar_url: c.other_user_avatar, last_seen: c.other_user_last_seen } : { name: c.name || "Group chat" },
-          }));
-          setConversations(items);
-          return cleanupSocket;
-        }
-        const conversationData = await getUserConversations();
-        const items = (conversationData.conversations || []).map((c) => ({ ...c, user: c.type === "direct" ? { id: c.other_user_id, name: c.other_user_name, email: c.other_user_email, avatar_url: c.other_user_avatar, last_seen: c.other_user_last_seen } : { name: c.name || "Group chat" } }));
-        if (!cancelled) setConversations(items);
+
+        if (!socket) return;
+
+        const handleConnect = () => {
+          setSocketConnected(true);
+          loadConversations().catch(console.error);
+        };
+
+        const handleDisconnect = () => {
+          setSocketConnected(false);
+        };
+
+        const handlePresenceSnapshot = (data) => {
+          setOnlineUserIds((data.onlineUserIds || []).map((id) => Number(id)));
+        };
+
+        const handlePresenceUpdate = (data) => {
+          const id = Number(data.userId);
+
+          setOnlineUserIds((previous) => {
+            if (data.online) {
+              return previous.includes(id) ? previous : [...previous, id];
+            }
+
+            return previous.filter((item) => item !== id);
+          });
+        };
+
+        const handleNewMessage = (message) => {
+          setConversations((previous) => {
+            const current = previous.find(
+              (item) => Number(item.id) === Number(message.conversation_id),
+            );
+
+            if (!current) {
+              loadConversations().catch(console.error);
+              return previous;
+            }
+
+            const isCurrentConversation =
+              Number(selectedConversationRef.current?.id) ===
+              Number(message.conversation_id);
+
+            const updated = {
+              ...current,
+              last_message: message.content,
+              last_message_at: message.created_at,
+              last_activity_at: message.created_at,
+              last_message_id: message.id,
+              unread_count: isCurrentConversation
+                ? 0
+                : Number(current.unread_count || 0) +
+                  (Number(message.sender_id) === Number(currentUser?.id)
+                    ? 0
+                    : 1),
+            };
+
+            return [
+              updated,
+              ...previous.filter(
+                (item) => Number(item.id) !== Number(updated.id),
+              ),
+            ];
+          });
+        };
+
+        const handleRead = (data) => {
+          setConversations((previous) =>
+            previous.map((item) =>
+              Number(item.id) === Number(data.conversationId)
+                ? {
+                    ...item,
+                    unread_count: 0,
+                  }
+                : item,
+            ),
+          );
+        };
+
+        socket.on("connect", handleConnect);
+        socket.on("disconnect", handleDisconnect);
+        socket.on("presence_snapshot", handlePresenceSnapshot);
+        socket.on("presence_update", handlePresenceUpdate);
+        socket.on("new_message", handleNewMessage);
+        socket.on("message_read", handleRead);
+
+        setSocketConnected(socket.connected);
+
+        return () => {
+          socket.off("connect", handleConnect);
+          socket.off("disconnect", handleDisconnect);
+          socket.off("presence_snapshot", handlePresenceSnapshot);
+          socket.off("presence_update", handlePresenceUpdate);
+          socket.off("new_message", handleNewMessage);
+          socket.off("message_read", handleRead);
+        };
       } catch (error) {
         console.error("Initialize app error:", error);
-        if (!cancelled && error.response?.status === 401) { localStorage.removeItem("token"); disconnectSocket(); setIsAuthenticated(false); }
-      } finally { if (!cancelled) setLoading(false); }
+
+        if (!cancelled && error.response?.status === 401) {
+          localStorage.removeItem("token");
+          disconnectSocket();
+          setIsAuthenticated(false);
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
     }
+
     initializeApp();
-    return () => { cancelled = true; disconnectSocket(); };
+
+    return () => {
+      cancelled = true;
+      disconnectSocket();
+    };
   }, [isAuthenticated]);
 
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    const socket = connectSocket();
-    if (!socket) return;
-    const handleNewMessage = (message) => {
-      setConversations((previous) => {
-        const index = previous.findIndex((c) => Number(c.id) === Number(message.conversation_id));
-        if (index === -1) return previous;
-        const selected = Number(selectedConversation?.id) === Number(message.conversation_id);
-        const updated = { ...previous[index], last_message: message.content, last_message_at: message.created_at, last_activity_at: message.created_at, unread_count: selected ? 0 : Number(previous[index].unread_count || 0) + (Number(message.sender_id) === Number(currentUser?.id) ? 0 : 1) };
-        return [updated, ...previous.filter((_, i) => i !== index)];
-      });
-    };
-    socket.on("new_message", handleNewMessage);
-    return () => socket.off("new_message", handleNewMessage);
-  }, [isAuthenticated, selectedConversation?.id, currentUser?.id]);
+  const handleLogout = () => {
+    disconnectSocket();
 
-  const handleLogout = () => { disconnectSocket(); localStorage.removeItem("token"); setCurrentUser(null); setConversations([]); setSelectedConversation(null); setShowMobileChat(false); setIsAuthenticated(false); };
+    localStorage.removeItem("token");
+
+    setCurrentUser(null);
+    setConversations([]);
+    setSelectedConversation(null);
+    setShowMobileChat(false);
+    setOnlineUserIds([]);
+    setIsAuthenticated(false);
+  };
 
   const handleConversationCreated = (conversation, user) => {
-    const item = { ...conversation, user: user || conversation.user || { name: conversation.name } };
-    setConversations((previous) => [item, ...previous.filter((c) => c.id !== item.id)]);
-    setSelectedConversation(item); setShowMobileChat(true);
+    const item = {
+      ...conversation,
+      user:
+        user ||
+        conversation.user ||
+        (conversation.type === "group"
+          ? {
+              id: conversation.id,
+              name: conversation.name || "Group chat",
+              avatar_url: conversation.avatar_url,
+            }
+          : null),
+      unread_count: 0,
+    };
+
+    setConversations((previous) => [
+      item,
+      ...previous.filter((c) => Number(c.id) !== Number(item.id)),
+    ]);
+
+    setSelectedConversation(item);
+    setShowMobileChat(true);
   };
 
   const handleSelectConversation = (conversation) => {
-    setConversations((previous) => previous.map((c) => c.id === conversation.id ? { ...c, unread_count: 0 } : c));
-    setSelectedConversation({ ...conversation, unread_count: 0 }); setShowMobileChat(true);
+    const updated = {
+      ...conversation,
+      unread_count: 0,
+    };
+
+    setConversations((previous) =>
+      previous.map((item) =>
+        Number(item.id) === Number(updated.id) ? updated : item,
+      ),
+    );
+
+    setSelectedConversation(updated);
+    setShowMobileChat(true);
+
+    const socket = getSocket();
+
+    socket?.emit(
+      "mark_read",
+      {
+        conversationId: Number(updated.id),
+      },
+      () => {},
+    );
   };
 
-  if (!isAuthenticated) return showRegister ? <Register onRegisterSuccess={() => setShowRegister(false)} onShowLogin={() => setShowRegister(false)} /> : <Login onLoginSuccess={() => setIsAuthenticated(true)} onShowRegister={() => setShowRegister(true)} />;
-  if (loading) return <div className="flex min-h-screen items-center justify-center bg-gray-50 text-gray-600">Loading chat...</div>;
-  if (!currentUser) return <div className="flex min-h-screen items-center justify-center bg-gray-50"><button onClick={handleLogout} className="cursor-pointer rounded-lg bg-green-700 px-5 py-3 text-white">Back to login</button></div>;
+  const handleGroupDeleted = async () => {
+    setShowMobileChat(false);
+    setSelectedConversation(null);
+
+    try {
+      await loadConversations();
+    } catch (error) {
+      console.error(
+        "Failed to reload conversations after group deletion:",
+        error,
+      );
+    }
+  };
+
+  if (!isAuthenticated) {
+    return showRegister ? (
+      <Register
+        onRegisterSuccess={() => setShowRegister(false)}
+        onShowLogin={() => setShowRegister(false)}
+      />
+    ) : (
+      <Login
+        onLoginSuccess={() => setIsAuthenticated(true)}
+        onShowRegister={() => setShowRegister(true)}
+      />
+    );
+  }
+
+  if (loading) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-gray-50 text-gray-600">
+        Loading chat...
+      </div>
+    );
+  }
+
+  if (!currentUser) {
+    return null;
+  }
 
   return (
     <div className="flex h-dvh flex-col bg-gray-50 p-0 sm:p-4">
-      <header className="flex h-14 shrink-0 items-center justify-between rounded-none bg-green-700 px-4 text-white sm:rounded-t-xl">
-        <div className="flex items-center gap-2 font-semibold"><span className="text-xl">◉</span>Real-Time Chat</div>
-        <div className="flex items-center gap-3"><span className="hidden text-xs sm:inline">{socketConnected ? "Connected" : "Reconnecting..."}</span><span className="hidden text-sm sm:inline">{currentUser.name}</span><button onClick={handleLogout} className="cursor-pointer rounded-md bg-white/15 px-3 py-2 text-sm hover:bg-white/25">Logout</button></div>
+      <header className="flex h-14 shrink-0 items-center justify-between bg-green-700 px-4 text-white sm:rounded-t-xl">
+        <div className="flex items-center gap-2 font-semibold">
+          <span className="text-xl">◉</span>
+          Real-Time Chat
+        </div>
+
+        <div className="flex items-center gap-3">
+          <span className="hidden text-sm sm:inline">{currentUser.name}</span>
+
+          <span
+            className={`hidden rounded-full px-2 py-1 text-[10px] sm:inline ${
+              socketConnected ? "bg-green-500" : "bg-red-500"
+            }`}
+          >
+            {socketConnected ? "Connected" : "Reconnecting..."}
+          </span>
+
+          <button
+            onClick={handleLogout}
+            className="cursor-pointer rounded-md bg-white/15 px-3 py-2 text-sm hover:bg-white/25"
+          >
+            Logout
+          </button>
+        </div>
       </header>
-      {!socketConnected && <div className="bg-amber-100 px-3 py-1 text-center text-xs font-medium text-amber-800">Reconnecting... Messages will sync when the connection returns.</div>}
-      <main className="flex min-h-0 flex-1 overflow-hidden border-x border-b border-gray-200 bg-white sm:rounded-b-xl">
-        <aside className={`${showMobileChat ? "hidden" : "flex"} w-full shrink-0 flex-col md:flex md:w-72 lg:w-80`}><Sidebar conversations={conversations} onConversationCreated={handleConversationCreated} onSelectConversation={handleSelectConversation} onlineUsers={onlineUsers} lastSeenByUser={lastSeenByUser} /></aside>
-        <section className={`${showMobileChat ? "flex" : "hidden"} min-h-0 min-w-0 flex-1 flex-col md:flex`}>
-          <ChatWindow conversation={selectedConversation} currentUser={currentUser} onBack={() => setShowMobileChat(false)} onlineUsers={onlineUsers} lastSeenByUser={lastSeenByUser} />
+
+      {!socketConnected && (
+        <div className="shrink-0 bg-yellow-100 px-3 py-2 text-center text-xs text-yellow-800">
+          Reconnecting... Messages will sync when connection returns.
+        </div>
+      )}
+
+      <main className="relative flex min-h-0 flex-1 overflow-hidden border-x border-b border-gray-200 bg-white sm:rounded-b-xl">
+        <aside
+          className={`${
+            showMobileChat ? "hidden" : "flex"
+          } w-full shrink-0 flex-col md:flex md:w-72 lg:w-80`}
+        >
+          <Sidebar
+            conversations={conversations}
+            onlineUserIds={onlineUserIds}
+            selectedConversationId={selectedConversation?.id}
+            onConversationCreated={handleConversationCreated}
+            onSelectConversation={handleSelectConversation}
+          />
+        </aside>
+
+        <section
+          className={`${
+            showMobileChat ? "flex" : "hidden"
+          } min-h-0 min-w-0 flex-1 flex-col md:flex`}
+        >
+          <ChatWindow
+            conversation={selectedConversation}
+            currentUser={currentUser}
+            onBack={() => setShowMobileChat(false)}
+            onGroupDeleted={handleGroupDeleted}
+            onConversationChanged={() =>
+              loadConversations().catch(console.error)
+            }
+          />
         </section>
       </main>
     </div>

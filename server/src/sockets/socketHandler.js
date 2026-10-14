@@ -1,12 +1,55 @@
 const { pool } = require("../config/db");
-
 const messageModel = require("../models/messageModel");
-
 const userModels = require("../models/userModels");
 
 const userSockets = new Map();
 
 const roomName = (conversationId) => `conversation:${conversationId}`;
+
+const normalizePayload = (data) => {
+  if (data === null || data === undefined) {
+    return {};
+  }
+
+  if (typeof data === "string") {
+    try {
+      return JSON.parse(data);
+    } catch {
+      return {
+        conversationId: data,
+      };
+    }
+  }
+
+  if (typeof data === "number") {
+    return {
+      conversationId: data,
+    };
+  }
+
+  if (typeof data === "object") {
+    return data;
+  }
+
+  return {};
+};
+
+const getConversationId = (data) => {
+  const payload = normalizePayload(data);
+
+  const value =
+    payload.conversationId ??
+    payload.conversation_id ??
+    payload.id;
+
+  const conversationId = Number(value);
+
+  if (!Number.isInteger(conversationId) || conversationId <= 0) {
+    return null;
+  }
+
+  return conversationId;
+};
 
 const addSocketForUser = (userId, socketId) => {
   const key = Number(userId);
@@ -20,7 +63,6 @@ const addSocketForUser = (userId, socketId) => {
 
 const removeSocketForUser = (userId, socketId) => {
   const key = Number(userId);
-
   const sockets = userSockets.get(key);
 
   if (!sockets) {
@@ -31,7 +73,6 @@ const removeSocketForUser = (userId, socketId) => {
 
   if (sockets.size === 0) {
     userSockets.delete(key);
-
     return 0;
   }
 
@@ -54,16 +95,14 @@ const emitToConversationMembers = async (
   io,
   conversationId,
   event,
-  payload,
+  payload
 ) => {
-  try {
-    const members = await messageModel.getConversationMemberIds(conversationId);
+  const members = await messageModel.getConversationMemberIds(
+    conversationId
+  );
 
-    for (const member of members) {
-      emitToUser(io, member.user_id, event, payload);
-    }
-  } catch (error) {
-    console.error("Conversation member broadcast error:", error);
+  for (const member of members) {
+    emitToUser(io, member.user_id, event, payload);
   }
 };
 
@@ -73,22 +112,17 @@ const broadcastPresence = async (io, userId, online) => {
 
     io.emit("presence_update", {
       userId: Number(userId),
-
       online,
-
+      status: online ? "online" : "offline",
       lastSeen: user?.last_seen || null,
     });
   } catch (error) {
-    console.error("Presence broadcast error:", error);
-
-    // Do not terminate socket because
-    // of a presence database error.
+    console.error("Broadcast presence error:", error);
 
     io.emit("presence_update", {
       userId: Number(userId),
-
       online,
-
+      status: online ? "online" : "offline",
       lastSeen: null,
     });
   }
@@ -96,513 +130,830 @@ const broadcastPresence = async (io, userId, online) => {
 
 const socketHandler = (io) => {
   io.on("connection", async (socket) => {
-    const userId = Number(socket.user?.id);
+    try {
+      const userId = Number(socket.user?.id);
 
-    if (!userId) {
-      console.error("Socket user ID missing");
-
-      socket.disconnect(true);
-
-      return;
-    }
-
-    addSocketForUser(userId, socket.id);
-
-    console.log(
-      "Socket connected:",
-      socket.id,
-      "User:",
-      userId,
-      "Open tabs:",
-      userSockets.get(userId)?.size,
-    );
-
-    // Send currently connected users.
-    socket.emit("presence_snapshot", {
-      onlineUserIds: [...userSockets.keys()],
-    });
-
-    // Only first tab changes
-    // user to online.
-    if (userSockets.get(userId)?.size === 1) {
-      await broadcastPresence(io, userId, true);
-    }
-
-    socket.on("join_conversation", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
-
-      try {
-        const conversationId = Number(data.conversationId);
-
-        if (!Number.isInteger(conversationId) || conversationId <= 0) {
-          return reply({
-            success: false,
-            message: "Valid conversation ID is required",
-          });
-        }
-
-        const membership = await messageModel.isConversationMember(
-          conversationId,
-          userId,
-        );
-
-        if (!membership) {
-          return reply({
-            success: false,
-            message: "You are not a member of this conversation",
-          });
-        }
-
-        await socket.join(roomName(conversationId));
-
-        // Delivery tracking should
-        // never destroy the socket.
-        try {
-          await messageModel.markDelivered(conversationId, userId);
-        } catch (deliveryError) {
-          console.error("Mark delivered error:", deliveryError);
-        }
-
-        await emitToConversationMembers(
-          io,
-          conversationId,
-          "message_delivered",
-          {
-            conversationId,
-            userId,
-          },
-        );
-
-        return reply({
-          success: true,
-          message: "Joined conversation",
-          conversationId,
-          role: membership.role,
-        });
-      } catch (error) {
-        console.error("Join conversation error:", error);
-
-        return reply({
-          success: false,
-          message: "Unable to join conversation",
-        });
+      if (!userId) {
+        socket.disconnect(true);
+        return;
       }
-    });
 
-    socket.on("send_message", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
+      const user = await userModels.getUserById(userId);
 
-      try {
-        const conversationId = Number(data.conversationId);
+      socket.user.name = user?.name || `User ${userId}`;
 
-        const content =
-          typeof data.content === "string" ? data.content.trim() : "";
+      addSocketForUser(userId, socket.id);
 
-        const clientMessageId =
-          typeof data.clientMessageId === "string"
-            ? data.clientMessageId.slice(0, 100)
-            : null;
+      console.log(
+        "Socket connected:",
+        socket.id,
+        "User:",
+        userId,
+        "Open tabs:",
+        userSockets.get(userId)?.size
+      );
 
-        if (!Number.isInteger(conversationId) || conversationId <= 0) {
-          return reply({
-            success: false,
-            message: "Valid conversation ID is required",
-          });
-        }
+      await pool
+        .query(
+          `UPDATE users
+           SET last_seen = NULL
+           WHERE id = $1`,
+          [userId]
+        )
+        .catch(() => {});
 
-        if (!content || content.length > 5000) {
-          return reply({
-            success: false,
-            message: "Message must contain 1 to 5000 characters",
-          });
-        }
+      const onlineUserIds = [...userSockets.keys()].map(Number);
 
-        const membership = await messageModel.isConversationMember(
-          conversationId,
-          userId,
-        );
+      socket.emit("presence_snapshot", {
+        onlineUserIds,
+        onlineUsers: onlineUserIds,
+      });
 
-        if (!membership) {
-          return reply({
-            success: false,
-            message: "You are not a member of this conversation",
-          });
-        }
+      if (userSockets.get(userId)?.size === 1) {
+        await broadcastPresence(io, userId, true);
+      }
 
-        const message = await messageModel.createMessage(
-          conversationId,
-          userId,
-          content,
-          clientMessageId,
-        );
+      socket.on("join_conversation", async (data = {}, callback) => {
+        const reply =
+          typeof callback === "function" ? callback : () => {};
 
         try {
-          await messageModel.ensureDeliveryRows(
-            message.id,
+          const conversationId = getConversationId(data);
+
+          if (!conversationId) {
+            return reply({
+              success: false,
+              message: "Valid conversation ID is required",
+            });
+          }
+
+          const membership =
+            await messageModel.isConversationMember(
+              conversationId,
+              userId
+            );
+
+          if (!membership) {
+            return reply({
+              success: false,
+              message:
+                "You are not a member of this conversation",
+            });
+          }
+
+          await socket.join(roomName(conversationId));
+
+          try {
+            await messageModel.markDelivered(
+              conversationId,
+              userId
+            );
+          } catch (error) {
+            console.error(
+              "Mark delivered error:",
+              error
+            );
+          }
+
+          try {
+            await emitToConversationMembers(
+              io,
+              conversationId,
+              "message_delivered",
+              {
+                conversationId,
+                userId,
+              }
+            );
+          } catch (error) {
+            console.error(
+              "Delivery broadcast error:",
+              error
+            );
+          }
+
+          return reply({
+            success: true,
             conversationId,
-            userId,
+            role: membership.role,
+          });
+        } catch (error) {
+          console.error(
+            "Join conversation error:",
+            error
           );
-        } catch (deliveryError) {
-          console.error("Create delivery rows error:", deliveryError);
-        }
 
-        await emitToConversationMembers(
-          io,
-          conversationId,
-          "new_message",
-          message,
-        );
-
-        return reply({
-          success: true,
-          message,
-        });
-      } catch (error) {
-        console.error("Send message error:", error);
-
-        return reply({
-          success: false,
-          message: "Unable to send message",
-        });
-      }
-    });
-
-    socket.on("typing_start", async (data = {}) => {
-      try {
-        const conversationId = Number(data.conversationId);
-
-        const membership = await messageModel.isConversationMember(
-          conversationId,
-          userId,
-        );
-
-        if (!membership) {
-          return;
-        }
-
-        await emitToConversationMembers(io, conversationId, "typing_start", {
-          conversationId,
-          userId,
-        });
-      } catch (error) {
-        console.error("Typing start error:", error);
-      }
-    });
-
-    socket.on("typing_stop", async (data = {}) => {
-      try {
-        const conversationId = Number(data.conversationId);
-
-        const membership = await messageModel.isConversationMember(
-          conversationId,
-          userId,
-        );
-
-        if (!membership) {
-          return;
-        }
-
-        await emitToConversationMembers(io, conversationId, "typing_stop", {
-          conversationId,
-          userId,
-        });
-      } catch (error) {
-        console.error("Typing stop error:", error);
-      }
-    });
-
-    socket.on("mark_read", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
-
-      try {
-        const conversationId = Number(data.conversationId);
-
-        const membership = await messageModel.isConversationMember(
-          conversationId,
-          userId,
-        );
-
-        if (!membership) {
           return reply({
             success: false,
-            message: "You are not a member of this conversation",
+            message: "Unable to join conversation",
           });
         }
+      });
 
-        const latestId = await messageModel.markRead(conversationId, userId);
+      socket.on("send_message", async (data = {}, callback) => {
+        const reply =
+          typeof callback === "function" ? callback : () => {};
 
-        await emitToConversationMembers(io, conversationId, "message_read", {
-          conversationId,
-          userId,
-          messageId: latestId,
-        });
+        try {
+          const payload = normalizePayload(data);
 
-        return reply({
-          success: true,
-          messageId: latestId,
-        });
-      } catch (error) {
-        console.error("Mark read error:", error);
+          const conversationId =
+            getConversationId(payload);
 
-        return reply({
-          success: false,
-          message: "Unable to mark messages as read",
-        });
-      }
-    });
+          const content =
+            typeof payload.content === "string"
+              ? payload.content.trim()
+              : "";
 
-    socket.on("edit_message", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
+          const clientMessageId =
+            typeof payload.clientMessageId === "string"
+              ? payload.clientMessageId
+                  .trim()
+                  .slice(0, 100)
+              : null;
 
-      try {
-        const messageId = Number(data.messageId);
+          if (!conversationId) {
+            return reply({
+              success: false,
+              message:
+                "Valid conversation ID is required",
+            });
+          }
 
-        const content =
-          typeof data.content === "string" ? data.content.trim() : "";
+          if (!content || content.length > 5000) {
+            return reply({
+              success: false,
+              message:
+                "Message must contain 1 to 5000 characters",
+            });
+          }
 
-        if (!messageId) {
+          const membership =
+            await messageModel.isConversationMember(
+              conversationId,
+              userId
+            );
+
+          if (!membership) {
+            return reply({
+              success: false,
+              message:
+                "You are not a member of this conversation",
+            });
+          }
+
+          if (clientMessageId) {
+            const existing = await pool.query(
+              `SELECT
+                id,
+                conversation_id,
+                sender_id,
+                content,
+                client_message_id,
+                created_at,
+                updated_at,
+                edited,
+                deleted_at
+               FROM messages
+               WHERE client_message_id = $1
+               LIMIT 1`,
+              [clientMessageId]
+            );
+
+            if (existing.rows[0]) {
+              const previous = existing.rows[0];
+
+              if (
+                Number(previous.sender_id) !== userId ||
+                Number(previous.conversation_id) !==
+                  conversationId
+              ) {
+                return reply({
+                  success: false,
+                  message:
+                    "Invalid client message ID",
+                });
+              }
+
+              return reply({
+                success: true,
+                duplicate: true,
+                data: {
+                  ...previous,
+                  sender_name:
+                    socket.user.name,
+                  reactions: [],
+                },
+              });
+            }
+          }
+
+          const message =
+            await messageModel.createMessage(
+              conversationId,
+              userId,
+              content,
+              clientMessageId
+            );
+
+          try {
+            await messageModel.ensureDeliveryRows(
+              message.id,
+              conversationId,
+              userId
+            );
+          } catch (error) {
+            console.error(
+              "Ensure delivery rows error:",
+              error
+            );
+          }
+
+          await pool.query(
+            `UPDATE conversations
+             SET updated_at = CURRENT_TIMESTAMP
+             WHERE id = $1`,
+            [conversationId]
+          );
+
+          const messageForClient = {
+            ...message,
+            sender_name: socket.user.name,
+            reactions: [],
+          };
+
+          await emitToConversationMembers(
+            io,
+            conversationId,
+            "new_message",
+            messageForClient
+          );
+
           return reply({
-            success: false,
-            message: "Valid message ID is required",
+            success: true,
+            message:
+              "Message sent successfully",
+            data: messageForClient,
           });
-        }
+        } catch (error) {
+          console.error(
+            "Socket send_message error:",
+            error
+          );
 
-        if (!content || content.length > 5000) {
-          return reply({
-            success: false,
-            message: "Message cannot be empty",
-          });
-        }
-
-        const existing = await messageModel.getMessageById(messageId);
-
-        if (!existing) {
-          return reply({
-            success: false,
-            message: "Message not found",
-          });
-        }
-
-        const membership = await messageModel.isConversationMember(
-          existing.conversation_id,
-          userId,
-        );
-
-        if (!membership) {
-          return reply({
-            success: false,
-            message: "You are not a member of this conversation",
-          });
-        }
-
-        const updated = await messageModel.editMessage(
-          messageId,
-          userId,
-          content,
-        );
-
-        if (!updated) {
-          return reply({
-            success: false,
-            message: "Only your own message can be edited",
-          });
-        }
-
-        await emitToConversationMembers(
-          io,
-          updated.conversation_id,
-          "message_edited",
-          updated,
-        );
-
-        return reply({
-          success: true,
-          message: updated,
-        });
-      } catch (error) {
-        console.error("Edit message error:", error);
-
-        return reply({
-          success: false,
-          message: "Unable to edit message",
-        });
-      }
-    });
-
-    socket.on("delete_message", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
-
-      try {
-        const messageId = Number(data.messageId);
-
-        const existing = await messageModel.getMessageById(messageId);
-
-        if (!existing) {
-          return reply({
-            success: false,
-            message: "Message not found",
-          });
-        }
-
-        const membership = await messageModel.isConversationMember(
-          existing.conversation_id,
-          userId,
-        );
-
-        if (!membership) {
-          return reply({
-            success: false,
-            message: "You are not a member of this conversation",
-          });
-        }
-
-        const deleted = await messageModel.deleteMessage(messageId, userId);
-
-        if (!deleted) {
           return reply({
             success: false,
             message:
-              "Message cannot be deleted. Only your own messages within 10 minutes can be deleted.",
+              "Unable to send message",
           });
         }
+      });
 
-        await emitToConversationMembers(
-          io,
-          deleted.conversation_id,
-          "message_deleted",
-          deleted,
-        );
+      socket.on("typing_start", async (data = {}) => {
+        try {
+          const conversationId =
+            getConversationId(data);
 
-        return reply({
-          success: true,
-          message: deleted,
-        });
-      } catch (error) {
-        console.error("Delete message error:", error);
+          if (!conversationId) {
+            return;
+          }
 
-        return reply({
-          success: false,
-          message: "Unable to delete message",
-        });
-      }
-    });
+          const membership =
+            await messageModel.isConversationMember(
+              conversationId,
+              userId
+            );
 
-    socket.on("react_message", async (data = {}, callback) => {
-      const reply = typeof callback === "function" ? callback : () => {};
+          if (!membership) {
+            return;
+          }
 
-      try {
-        const messageId = Number(data.messageId);
+          const now = Date.now();
 
-        const emoji = typeof data.emoji === "string" ? data.emoji.trim() : "";
+          if (!socket._typingTimes) {
+            socket._typingTimes = new Map();
+          }
 
-        if (!messageId || !emoji) {
-          return reply({
-            success: false,
-            message: "Message ID and emoji are required",
-          });
-        }
+          const last =
+            socket._typingTimes.get(
+              conversationId
+            ) || 0;
 
-        const message = await messageModel.getMessageById(messageId);
+          if (now - last < 500) {
+            return;
+          }
 
-        if (!message) {
-          return reply({
-            success: false,
-            message: "Message not found",
-          });
-        }
-
-        const membership = await messageModel.isConversationMember(
-          message.conversation_id,
-          userId,
-        );
-
-        if (!membership) {
-          return reply({
-            success: false,
-            message: "You are not a member of this conversation",
-          });
-        }
-
-        const existing = await pool.query(
-          `SELECT id
-
-                 FROM message_reactions
-
-                 WHERE
-                   message_id = $1
-                   AND user_id = $2
-                   AND emoji = $3`,
-          [messageId, userId, emoji],
-        );
-
-        let reaction;
-
-        if (existing.rowCount) {
-          reaction = await messageModel.removeReaction(
-            messageId,
-            userId,
-            emoji,
+          socket._typingTimes.set(
+            conversationId,
+            now
           );
-        } else {
-          reaction = await messageModel.addReaction(messageId, userId, emoji);
+
+          socket
+            .to(roomName(conversationId))
+            .emit("typing_start", {
+              conversationId,
+              userId,
+              name: socket.user.name,
+            });
+        } catch (error) {
+          console.error(
+            "Typing start error:",
+            error
+          );
         }
+      });
 
-        const payload = {
-          messageId,
+      socket.on("typing_stop", async (data = {}) => {
+        try {
+          const conversationId =
+            getConversationId(data);
 
-          conversationId: message.conversation_id,
+          if (!conversationId) {
+            return;
+          }
 
-          userId,
+          const membership =
+            await messageModel.isConversationMember(
+              conversationId,
+              userId
+            );
 
-          emoji,
+          if (!membership) {
+            return;
+          }
 
-          action: existing.rowCount ? "removed" : "added",
+          socket
+            .to(roomName(conversationId))
+            .emit("typing_stop", {
+              conversationId,
+              userId,
+            });
+        } catch (error) {
+          console.error(
+            "Typing stop error:",
+            error
+          );
+        }
+      });
 
-          reaction,
-        };
+      socket.on(
+        "mark_read",
+        async (data = {}, callback) => {
+          const reply =
+            typeof callback === "function"
+              ? callback
+              : () => {};
 
-        await emitToConversationMembers(
-          io,
-          message.conversation_id,
-          "message_reaction",
-          payload,
-        );
+          try {
+            const payload =
+              normalizePayload(data);
 
-        return reply({
-          success: true,
-          ...payload,
-        });
-      } catch (error) {
-        console.error("Reaction error:", error);
+            const conversationId =
+              getConversationId(payload);
 
-        return reply({
-          success: false,
-          message: "Unable to update reaction",
-        });
-      }
-    });
+            if (!conversationId) {
+              return reply({
+                success: false,
+                message:
+                  "Valid conversation ID is required",
+              });
+            }
 
-    socket.on("disconnect", async (reason) => {
-      const remaining = removeSocketForUser(userId, socket.id);
+            const membership =
+              await messageModel.isConversationMember(
+                conversationId,
+                userId
+              );
 
-      console.log(
-        "Socket disconnected:",
-        socket.id,
-        reason,
-        "Remaining tabs:",
-        remaining,
+            if (!membership) {
+              return reply({
+                success: false,
+                message:
+                  "You are not a member of this conversation",
+              });
+            }
+
+            const lastReadMessageId =
+              await messageModel.markRead(
+                conversationId,
+                userId
+              );
+
+            const summary =
+              lastReadMessageId
+                ? await messageModel.getReadSummary(
+                    conversationId,
+                    lastReadMessageId
+                  )
+                : null;
+
+            const readPayload = {
+              conversationId,
+              userId,
+              lastReadMessageId,
+              summary,
+            };
+
+            await emitToConversationMembers(
+              io,
+              conversationId,
+              "message_read",
+              readPayload
+            );
+
+            return reply({
+              success: true,
+              ...readPayload,
+            });
+          } catch (error) {
+            console.error(
+              "Mark read error:",
+              error
+            );
+
+            return reply({
+              success: false,
+              message:
+                "Unable to mark messages as read",
+            });
+          }
+        }
       );
 
-      if (remaining === 0) {
-        try {
-          await userModels.updateLastSeen(userId);
-        } catch (error) {
-          console.error("Update last seen error:", error);
-        }
+      socket.on(
+        "edit_message",
+        async (data = {}, callback) => {
+          const reply =
+            typeof callback === "function"
+              ? callback
+              : () => {};
 
-        await broadcastPresence(io, userId, false);
-      }
-    });
+          try {
+            const payload =
+              normalizePayload(data);
+
+            const messageId = Number(
+              payload.messageId
+            );
+
+            const content =
+              typeof payload.content === "string"
+                ? payload.content.trim()
+                : "";
+
+            if (
+              !messageId ||
+              !content ||
+              content.length > 5000
+            ) {
+              return reply({
+                success: false,
+                message:
+                  "Valid message ID and content are required",
+              });
+            }
+
+            const existing =
+              await messageModel.getMessageById(
+                messageId
+              );
+
+            if (
+              !existing ||
+              Number(existing.sender_id) !==
+                userId
+            ) {
+              return reply({
+                success: false,
+                message:
+                  "You can edit only your own messages",
+              });
+            }
+
+            const membership =
+              await messageModel.isConversationMember(
+                existing.conversation_id,
+                userId
+              );
+
+            if (!membership) {
+              return reply({
+                success: false,
+                message:
+                  "You are not a member of this conversation",
+              });
+            }
+
+            const updated =
+              await messageModel.editMessage(
+                messageId,
+                userId,
+                content
+              );
+
+            if (!updated) {
+              return reply({
+                success: false,
+                message:
+                  "Message cannot be edited",
+              });
+            }
+
+            await emitToConversationMembers(
+              io,
+              updated.conversation_id,
+              "message_edited",
+              updated
+            );
+
+            return reply({
+              success: true,
+              data: updated,
+            });
+          } catch (error) {
+            console.error(
+              "Edit message error:",
+              error
+            );
+
+            return reply({
+              success: false,
+              message:
+                "Unable to edit message",
+            });
+          }
+        }
+      );
+
+      socket.on(
+        "delete_message",
+        async (data = {}, callback) => {
+          const reply =
+            typeof callback === "function"
+              ? callback
+              : () => {};
+
+          try {
+            const payload =
+              normalizePayload(data);
+
+            const messageId = Number(
+              payload.messageId
+            );
+
+            if (!messageId) {
+              return reply({
+                success: false,
+                message:
+                  "Valid message ID is required",
+              });
+            }
+
+            const existing =
+              await messageModel.getMessageById(
+                messageId
+              );
+
+            if (
+              !existing ||
+              Number(existing.sender_id) !==
+                userId
+            ) {
+              return reply({
+                success: false,
+                message:
+                  "You can delete only your own messages",
+              });
+            }
+
+            const membership =
+              await messageModel.isConversationMember(
+                existing.conversation_id,
+                userId
+              );
+
+            if (!membership) {
+              return reply({
+                success: false,
+                message:
+                  "You are not a member of this conversation",
+              });
+            }
+
+            const deleted =
+              await messageModel.deleteMessage(
+                messageId,
+                userId
+              );
+
+            if (!deleted) {
+              return reply({
+                success: false,
+                message:
+                  "Message can be deleted only within 10 minutes",
+              });
+            }
+
+            await emitToConversationMembers(
+              io,
+              deleted.conversation_id,
+              "message_deleted",
+              deleted
+            );
+
+            return reply({
+              success: true,
+              data: deleted,
+            });
+          } catch (error) {
+            console.error(
+              "Delete message error:",
+              error
+            );
+
+            return reply({
+              success: false,
+              message:
+                "Unable to delete message",
+            });
+          }
+        }
+      );
+
+      socket.on(
+        "react_message",
+        async (data = {}, callback) => {
+          const reply =
+            typeof callback === "function"
+              ? callback
+              : () => {};
+
+          try {
+            const payload =
+              normalizePayload(data);
+
+            const messageId = Number(
+              payload.messageId
+            );
+
+            const emoji =
+              typeof payload.emoji === "string"
+                ? payload.emoji
+                    .trim()
+                    .slice(0, 20)
+                : "";
+
+            if (!messageId || !emoji) {
+              return reply({
+                success: false,
+                message:
+                  "messageId and emoji are required",
+              });
+            }
+
+            const message =
+              await messageModel.getMessageById(
+                messageId
+              );
+
+            if (!message) {
+              return reply({
+                success: false,
+                message: "Message not found",
+              });
+            }
+
+            const membership =
+              await messageModel.isConversationMember(
+                message.conversation_id,
+                userId
+              );
+
+            if (!membership) {
+              return reply({
+                success: false,
+                message:
+                  "You are not a member of this conversation",
+              });
+            }
+
+            const existing =
+              await pool.query(
+                `SELECT id
+                 FROM message_reactions
+                 WHERE message_id = $1
+                 AND user_id = $2
+                 AND emoji = $3`,
+                [
+                  messageId,
+                  userId,
+                  emoji,
+                ]
+              );
+
+            let reaction;
+
+            if (existing.rowCount) {
+              reaction =
+                await messageModel.removeReaction(
+                  messageId,
+                  userId,
+                  emoji
+                );
+            } else {
+              reaction =
+                await messageModel.addReaction(
+                  messageId,
+                  userId,
+                  emoji
+                );
+            }
+
+            const reactionPayload = {
+              messageId,
+              conversationId:
+                message.conversation_id,
+              userId,
+              emoji,
+              action: existing.rowCount
+                ? "removed"
+                : "added",
+              reaction,
+            };
+
+            await emitToConversationMembers(
+              io,
+              message.conversation_id,
+              "message_reaction",
+              reactionPayload
+            );
+
+            return reply({
+              success: true,
+              ...reactionPayload,
+            });
+          } catch (error) {
+            console.error(
+              "Reaction error:",
+              error
+            );
+
+            return reply({
+              success: false,
+              message:
+                "Unable to update reaction",
+            });
+          }
+        }
+      );
+
+      socket.on("disconnect", async (reason) => {
+        const remaining =
+          removeSocketForUser(
+            userId,
+            socket.id
+          );
+
+        console.log(
+          "Socket disconnected:",
+          socket.id,
+          reason,
+          "Remaining tabs:",
+          remaining
+        );
+
+        if (remaining === 0) {
+          try {
+            const lastSeen = new Date();
+
+            await pool.query(
+              `UPDATE users
+               SET last_seen = $1
+               WHERE id = $2`,
+              [lastSeen, userId]
+            );
+
+            await broadcastPresence(
+              io,
+              userId,
+              false
+            );
+          } catch (error) {
+            console.error(
+              "Update last seen error:",
+              error
+            );
+          }
+        }
+      });
+    } catch (error) {
+      console.error(
+        "Socket connection setup error:",
+        error
+      );
+
+      socket.disconnect(true);
+    }
   });
 };
 

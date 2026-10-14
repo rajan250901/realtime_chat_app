@@ -1,86 +1,144 @@
+const groupModel = require("../models/groupModel");
 const { pool } = require("../config/db");
 
 const getMembership = async (conversationId, userId) => {
   const result = await pool.query(
-    `SELECT conversation_id, user_id, role FROM conversation_members WHERE conversation_id = $1 AND user_id = $2`,
-    [conversationId, userId]
+    `SELECT user_id, role
+     FROM conversation_members
+     WHERE conversation_id = $1
+       AND user_id = $2`,
+    [conversationId, userId],
   );
+
   return result.rows[0] || null;
 };
 
-const canManageGroup = (role) => role === "owner" || role === "admin";
-
-const createGroup = async (req, res) => {
-  const client = await pool.connect();
+const create = async (req, res) => {
   try {
-    const ownerId = Number(req.user.id);
     const { name, memberIds = [] } = req.body;
-    const groupName = String(name || "").trim();
-    if (!groupName) return res.status(400).json({ success: false, message: "Group name is required" });
-    if (groupName.length > 100) return res.status(400).json({ success: false, message: "Group name must be 100 characters or less" });
 
-    const ids = [...new Set([ownerId, ...memberIds.map(Number).filter(Number.isInteger)])];
-    await client.query("BEGIN");
-    const groupResult = await client.query(
-      `INSERT INTO conversations (type, name, created_by) VALUES ('group', $1, $2) RETURNING id, type, name, avatar_url, created_by, created_at, updated_at`,
-      [groupName, ownerId]
-    );
-    const group = groupResult.rows[0];
-
-    for (const id of ids) {
-      await client.query(
-        `INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT (conversation_id, user_id) DO UPDATE SET role = EXCLUDED.role`,
-        [group.id, id, id === ownerId ? "owner" : "member"]
-      );
+    if (!name?.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "Group name is required",
+      });
     }
-    await client.query("COMMIT");
-    return res.status(201).json({ success: true, group });
+
+    const cleanMemberIds = Array.isArray(memberIds)
+      ? [...new Set(memberIds.map(Number).filter(Number.isInteger))]
+      : [];
+
+    const conversation = await groupModel.createGroup(
+      name.trim(),
+      req.user.id,
+      cleanMemberIds,
+    );
+
+    return res.status(201).json({
+      success: true,
+      message: "Group created successfully",
+      conversation,
+    });
   } catch (error) {
-    await client.query("ROLLBACK");
     console.error("Create group error:", error);
-    return res.status(500).json({ success: false, message: "Unable to create group" });
-  } finally { client.release(); }
-};
 
-const getGroupDetails = async (req, res) => {
-  try {
-    const conversationId = Number(req.params.id);
-    const userId = Number(req.user.id);
-    const membership = await getMembership(conversationId, userId);
-    if (!membership) return res.status(403).json({ success: false, message: "You are not a member of this group" });
-
-    const groupResult = await pool.query(
-      `SELECT id, type, name, avatar_url, created_by, created_at, updated_at FROM conversations WHERE id = $1 AND type = 'group'`,
-      [conversationId]
-    );
-    if (!groupResult.rows[0]) return res.status(404).json({ success: false, message: "Group not found" });
-
-    const members = await pool.query(
-      `SELECT u.id, u.name, u.email, u.avatar_url, u.last_seen, cm.role, cm.joined_at
-       FROM conversation_members cm JOIN users u ON u.id = cm.user_id
-       WHERE cm.conversation_id = $1 ORDER BY CASE cm.role WHEN 'owner' THEN 1 WHEN 'admin' THEN 2 ELSE 3 END, u.name ASC`,
-      [conversationId]
-    );
-    return res.json({ success: true, group: groupResult.rows[0], members: members.rows, myRole: membership.role });
-  } catch (error) {
-    console.error("Get group details error:", error);
-    return res.status(500).json({ success: false, message: "Unable to load group" });
+    return res.status(500).json({
+      success: false,
+      message: "Unable to create group",
+    });
   }
 };
 
-const addMembers = async (req, res) => {
+const info = async (req, res) => {
   try {
     const conversationId = Number(req.params.id);
-    const membership = await getMembership(conversationId, Number(req.user.id));
-    if (!membership || !canManageGroup(membership.role)) return res.status(403).json({ success: false, message: "Only owner/admin can add members" });
-    const memberIds = [...new Set((req.body.memberIds || []).map(Number).filter(Number.isInteger))];
-    for (const id of memberIds) {
-      await pool.query(`INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT (conversation_id, user_id) DO NOTHING`, [conversationId, id]);
+
+    if (!Number.isInteger(conversationId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid group id",
+      });
     }
-    return res.json({ success: true, message: "Members added" });
+
+    const group = await groupModel.getGroupInfo(conversationId, req.user.id);
+
+    if (!group) {
+      return res.status(404).json({
+        success: false,
+        message: "Group not found or you are not a member",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      group,
+    });
   } catch (error) {
-    console.error("Add members error:", error);
-    return res.status(500).json({ success: false, message: "Unable to add members" });
+    console.error("Group info error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to fetch group",
+    });
+  }
+};
+
+const requireAdmin = async (conversationId, userId) => {
+  const member = await getMembership(conversationId, userId);
+
+  if (!member) {
+    return null;
+  }
+
+  if (!["owner", "admin"].includes(member.role)) {
+    return null;
+  }
+
+  return member;
+};
+
+const addMember = async (req, res) => {
+  try {
+    const conversationId = Number(req.params.id);
+    const userId = Number(req.body.userId);
+
+    if (!Number.isInteger(conversationId) || !Number.isInteger(userId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid group or user id",
+      });
+    }
+
+    const actor = await requireAdmin(conversationId, req.user.id);
+
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin permission required",
+      });
+    }
+
+    const member = await groupModel.addMember(conversationId, userId);
+
+    if (!member) {
+      return res.status(400).json({
+        success: false,
+        message: "User is already a member",
+      });
+    }
+
+    return res.status(201).json({
+      success: true,
+      message: "Member added",
+      member,
+    });
+  } catch (error) {
+    console.error("Add member error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to add member",
+    });
   }
 };
 
@@ -88,87 +146,262 @@ const removeMember = async (req, res) => {
   try {
     const conversationId = Number(req.params.id);
     const targetId = Number(req.params.userId);
-    const membership = await getMembership(conversationId, Number(req.user.id));
+
+    const actor = await getMembership(conversationId, req.user.id);
+
+    if (!actor || !["owner", "admin"].includes(actor.role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin permission required",
+      });
+    }
+
     const target = await getMembership(conversationId, targetId);
-    if (!membership || !target) return res.status(404).json({ success: false, message: "Member not found" });
-    if (target.role === "owner") return res.status(403).json({ success: false, message: "Owner cannot be removed" });
-    if (membership.role === "admin" && target.role === "admin") return res.status(403).json({ success: false, message: "Admin cannot remove another admin" });
-    if (!canManageGroup(membership.role) && targetId !== Number(req.user.id)) return res.status(403).json({ success: false, message: "You cannot remove this member" });
-    await pool.query(`DELETE FROM conversation_members WHERE conversation_id = $1 AND user_id = $2`, [conversationId, targetId]);
-    return res.json({ success: true, message: "Member removed" });
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "Member not found",
+      });
+    }
+
+    if (target.role === "owner") {
+      return res.status(400).json({
+        success: false,
+        message: "Owner cannot be removed",
+      });
+    }
+
+    if (actor.role === "admin" && target.role === "admin") {
+      return res.status(403).json({
+        success: false,
+        message: "Admin cannot remove another admin",
+      });
+    }
+
+    const removed = await groupModel.removeMember(conversationId, targetId);
+
+    return res.status(200).json({
+      success: true,
+      message: "Member removed",
+      member: removed,
+    });
   } catch (error) {
     console.error("Remove member error:", error);
-    return res.status(500).json({ success: false, message: "Unable to remove member" });
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to remove member",
+    });
   }
 };
 
-const updateRole = async (req, res) => {
+const updateName = async (req, res) => {
   try {
     const conversationId = Number(req.params.id);
-    const targetId = Number(req.params.userId);
-    const role = req.body.role;
-    const membership = await getMembership(conversationId, Number(req.user.id));
-    const target = await getMembership(conversationId, targetId);
-    if (!membership || !target) return res.status(404).json({ success: false, message: "Member not found" });
-    if (membership.role !== "owner") return res.status(403).json({ success: false, message: "Only owner can change roles" });
-    if (!["admin", "member"].includes(role) || target.role === "owner") return res.status(400).json({ success: false, message: "Invalid role" });
-    await pool.query(`UPDATE conversation_members SET role = $1 WHERE conversation_id = $2 AND user_id = $3`, [role, conversationId, targetId]);
-    return res.json({ success: true, message: `Member is now ${role}` });
+    const name = req.body.name?.trim();
+
+    if (!name) {
+      return res.status(400).json({
+        success: false,
+        message: "Group name is required",
+      });
+    }
+
+    const actor = await requireAdmin(conversationId, req.user.id);
+
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "Admin permission required",
+      });
+    }
+
+    const group = await groupModel.updateGroupName(conversationId, name);
+
+    if (!group) {
+      return res.status(404).json({
+        success: false,
+        message: "Group not found",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Group name updated",
+      group,
+    });
   } catch (error) {
-    console.error("Update role error:", error);
-    return res.status(500).json({ success: false, message: "Unable to update role" });
+    console.error("Update group error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to update group",
+    });
   }
 };
 
-const transferOwner = async (req, res) => {
-  const client = await pool.connect();
+const changeRole = async (req, res) => {
+  try {
+    const conversationId = Number(req.params.id);
+    const targetUserId = Number(req.params.userId);
+    const role = req.body.role;
+
+    if (!Number.isInteger(conversationId) || !Number.isInteger(targetUserId)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid group or user id",
+      });
+    }
+
+    if (!["admin", "member"].includes(role)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid role",
+      });
+    }
+
+    const actor = await getMembership(conversationId, req.user.id);
+
+    if (!actor) {
+      return res.status(403).json({
+        success: false,
+        message: "You are not a member of this group",
+      });
+    }
+
+    if (actor.role !== "owner") {
+      return res.status(403).json({
+        success: false,
+        message: "Owner permission required",
+      });
+    }
+
+    const target = await getMembership(conversationId, targetUserId);
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "Target member not found",
+      });
+    }
+
+    if (target.role === "owner") {
+      return res.status(400).json({
+        success: false,
+        message: "Owner role cannot be changed",
+      });
+    }
+
+    const member = await groupModel.changeRole(
+      conversationId,
+      targetUserId,
+      role,
+    );
+
+    if (!member) {
+      return res.status(400).json({
+        success: false,
+        message: "Unable to update member role",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Member role updated",
+      member,
+    });
+  } catch (error) {
+    console.error("Change role error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Unable to change role",
+    });
+  }
+};
+
+const transferOwnership = async (req, res) => {
   try {
     const conversationId = Number(req.params.id);
     const newOwnerId = Number(req.body.userId);
-    const currentOwner = await getMembership(conversationId, Number(req.user.id));
-    const newOwner = await getMembership(conversationId, newOwnerId);
-    if (!currentOwner || currentOwner.role !== "owner") return res.status(403).json({ success: false, message: "Only owner can transfer ownership" });
-    if (!newOwner) return res.status(404).json({ success: false, message: "New owner must be a group member" });
-    await client.query("BEGIN");
-    await client.query(`UPDATE conversation_members SET role = 'admin' WHERE conversation_id = $1 AND user_id = $2`, [conversationId, Number(req.user.id)]);
-    await client.query(`UPDATE conversation_members SET role = 'owner' WHERE conversation_id = $1 AND user_id = $2`, [conversationId, newOwnerId]);
-    await client.query(`UPDATE conversations SET created_by = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, [newOwnerId, conversationId]);
-    await client.query("COMMIT");
-    return res.json({ success: true, message: "Ownership transferred" });
-  } catch (error) {
-    await client.query("ROLLBACK");
-    console.error("Transfer owner error:", error);
-    return res.status(500).json({ success: false, message: "Unable to transfer ownership" });
-  } finally { client.release(); }
-};
 
-const updateGroup = async (req, res) => {
-  try {
-    const conversationId = Number(req.params.id);
-    const membership = await getMembership(conversationId, Number(req.user.id));
-    if (!membership || !canManageGroup(membership.role)) return res.status(403).json({ success: false, message: "Only owner/admin can update the group" });
-    const name = req.body.name === undefined ? undefined : String(req.body.name).trim();
-    const avatarUrl = req.body.avatarUrl === undefined ? undefined : String(req.body.avatarUrl).trim();
-    if (name !== undefined && (!name || name.length > 100)) return res.status(400).json({ success: false, message: "Invalid group name" });
-    const result = await pool.query(`UPDATE conversations SET name = COALESCE($1, name), avatar_url = COALESCE($2, avatar_url), updated_at = CURRENT_TIMESTAMP WHERE id = $3 AND type = 'group' RETURNING id, type, name, avatar_url, updated_at`, [name ?? null, avatarUrl ?? null, conversationId]);
-    return res.json({ success: true, group: result.rows[0] });
+    const actor = await getMembership(conversationId, req.user.id);
+
+    if (!actor || actor.role !== "owner") {
+      return res.status(403).json({
+        success: false,
+        message: "Owner permission required",
+      });
+    }
+
+    const target = await getMembership(conversationId, newOwnerId);
+
+    if (!target) {
+      return res.status(404).json({
+        success: false,
+        message: "Target member not found",
+      });
+    }
+
+    const member = await groupModel.transferOwnership(
+      conversationId,
+      req.user.id,
+      newOwnerId,
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Ownership transferred",
+      member,
+    });
   } catch (error) {
-    console.error("Update group error:", error);
-    return res.status(500).json({ success: false, message: "Unable to update group" });
+    console.error("Transfer ownership error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: error.message || "Unable to transfer ownership",
+    });
   }
 };
 
-const deleteGroup = async (req, res) => {
+const removeGroup = async (req, res) => {
   try {
     const conversationId = Number(req.params.id);
-    const membership = await getMembership(conversationId, Number(req.user.id));
-    if (!membership || membership.role !== "owner") return res.status(403).json({ success: false, message: "Only owner can delete the group" });
-    await pool.query(`DELETE FROM conversations WHERE id = $1 AND type = 'group'`, [conversationId]);
-    return res.json({ success: true, message: "Group deleted" });
+
+    const actor = await getMembership(conversationId, req.user.id);
+
+    if (!actor || actor.role !== "owner") {
+      return res.status(403).json({
+        success: false,
+        message: "Owner permission required",
+      });
+    }
+
+    await groupModel.deleteGroup(conversationId);
+
+    return res.status(200).json({
+      success: true,
+      message: "Group deleted",
+      conversationId,
+    });
   } catch (error) {
     console.error("Delete group error:", error);
-    return res.status(500).json({ success: false, message: "Unable to delete group" });
+
+    return res.status(500).json({
+      success: false,
+      message: "Unable to delete group",
+    });
   }
 };
 
-module.exports = { createGroup, getGroupDetails, addMembers, removeMember, updateRole, transferOwner, updateGroup, deleteGroup };
+module.exports = {
+  create,
+  info,
+  addMember,
+  removeMember,
+  updateName,
+  changeRole,
+  transferOwnership,
+  removeGroup,
+};

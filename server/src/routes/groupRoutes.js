@@ -1,15 +1,34 @@
 const express = require("express");
-const authMiddleware = require("../middleware/authMiddleware");
-const controller = require("../controllers/groupController");
-
 const router = express.Router();
-router.post("/", authMiddleware, controller.createGroup);
-router.get("/:id", authMiddleware, controller.getGroupDetails);
-router.put("/:id", authMiddleware, controller.updateGroup);
-router.delete("/:id", authMiddleware, controller.deleteGroup);
-router.post("/:id/members", authMiddleware, controller.addMembers);
-router.delete("/:id/members/:userId", authMiddleware, controller.removeMember);
-router.patch("/:id/members/:userId/role", authMiddleware, controller.updateRole);
-router.post("/:id/transfer-owner", authMiddleware, controller.transferOwner);
+const authMiddleware = require("../middleware/authMiddleware");
+const groupController = require("../controllers/groupController");
+
+router.post("/", authMiddleware, groupController.create);
+
+router.get("/:id", authMiddleware, groupController.info);
+
+router.patch("/:id/name", authMiddleware, groupController.updateName);
+
+router.post("/:id/members", authMiddleware, groupController.addMember);
+
+router.delete(
+    "/:id/members/:userId",
+    authMiddleware,
+    groupController.removeMember,
+);
+
+router.patch(
+    "/:id/members/:userId/role",
+    authMiddleware,
+    groupController.changeRole,
+);
+
+router.post(
+    "/:id/transfer-owner",
+    authMiddleware,
+    groupController.transferOwnership,
+);
+
+router.delete("/:id", authMiddleware, groupController.removeGroup);
 
 module.exports = router;
